@@ -29,7 +29,7 @@ class SolverWrapper(object):
     A wrapper class for the training process
   """
 
-  def __init__(self, sess, network, imdb, roidb, valroidb, output_dir, tbdir, pretrained_model=None):
+  def __init__(self, sess, network, imdb, roidb, valroidb, output_dir, tbdir, train_rpn_only, pretrained_model=None):
     self.net = network
     self.imdb = imdb
     self.roidb = roidb
@@ -38,6 +38,7 @@ class SolverWrapper(object):
     self.tbdir = tbdir
     # Simply put '_val' at the end to save the summaries from the validation set
     self.tbvaldir = tbdir + '_val'
+    self.train_rpn_only = train_rpn_only
     if not os.path.exists(self.tbvaldir):
       os.makedirs(self.tbvaldir)
     self.pretrained_model = pretrained_model
@@ -118,7 +119,13 @@ class SolverWrapper(object):
       # Set the random seed for tensorflow
       tf.set_random_seed(cfg.RNG_SEED)
       # Build the main computation graph
-      layers = self.net.create_architecture('TRAIN', self.imdb.num_classes, tag='default',
+
+      if self.train_rpn_only:
+        layers = self.net.create_architecture_rpn('TRAIN', self.imdb.num_classes, tag='default',
+                                              anchor_scales=cfg.ANCHOR_SCALES,
+                                              anchor_ratios=cfg.ANCHOR_RATIOS)
+      else:
+        layers = self.net.create_architecture('TRAIN', self.imdb.num_classes, tag='default',
                                             anchor_scales=cfg.ANCHOR_SCALES,
                                             anchor_ratios=cfg.ANCHOR_RATIOS)
       # Define the loss
@@ -320,6 +327,85 @@ class SolverWrapper(object):
     self.writer.close()
     self.valwriter.close()
 
+  def train_model_rpn(self, sess, max_iters):
+    # Build data layers for both training and validation set
+    self.data_layer = RoIDataLayer(self.roidb, self.imdb.num_classes)
+    self.data_layer_val = RoIDataLayer(self.valroidb, self.imdb.num_classes, random=True)
+
+    # Construct the computation graph
+    lr, train_op = self.construct_graph(sess)
+
+    # Find previous snapshots if there is any to restore from
+    lsf, nfiles, sfiles = self.find_previous()
+
+    # Initialize the variables or restore them from the last snapshot
+    if lsf == 0:
+      rate, last_snapshot_iter, stepsizes, np_paths, ss_paths = self.initialize(sess)
+    else:
+      rate, last_snapshot_iter, stepsizes, np_paths, ss_paths = self.restore(sess,
+                                                                            str(sfiles[-1]),
+                                                                            str(nfiles[-1]))
+    timer = Timer()
+    iter = last_snapshot_iter + 1
+    last_summary_time = time.time()
+    # Make sure the lists are not empty
+    stepsizes.append(max_iters)
+    stepsizes.reverse()
+    next_stepsize = stepsizes.pop()
+    while iter < max_iters + 1:
+      # Learning rate
+      if iter == next_stepsize + 1:
+        # Add snapshot here before reducing the learning rate
+        self.snapshot(sess, iter)
+        rate *= cfg.TRAIN.GAMMA
+        sess.run(tf.assign(lr, rate))
+        next_stepsize = stepsizes.pop()
+
+      timer.tic()
+      # Get training data, one batch at a time
+      blobs = self.data_layer.forward()
+
+      now = time.time()
+      if iter == 1 or now - last_summary_time > cfg.TRAIN.SUMMARY_INTERVAL:
+        # Compute the graph with summary
+        rpn_loss_cls, rpn_loss_box, total_loss, summary = self.net.train_step_rpn_with_summary(sess, blobs, train_op)
+        self.writer.add_summary(summary, float(iter))
+        # Also check the summary on the validation set
+        blobs_val = self.data_layer_val.forward()
+        summary_val = self.net.get_summary(sess, blobs_val)
+        self.valwriter.add_summary(summary_val, float(iter))
+        last_summary_time = now
+      else:
+        # Compute the graph without summary
+        rpn_loss_cls, rpn_loss_box, total_loss = self.net.train_step_rpn(sess, blobs, train_op)
+      timer.toc()
+
+      # Display training information
+      if iter % (cfg.TRAIN.DISPLAY) == 0:
+        print('iter: %d / %d, total loss: %.6f\n >>> rpn_loss_cls: %.6f\n '
+              '>>> rpn_loss_box: %.6f\n >>> lr: %f' % \
+              (iter, max_iters, total_loss, rpn_loss_cls, rpn_loss_box, lr.eval()))
+        print('speed: {:.3f}s / iter'.format(timer.average_time))
+
+      # Snapshotting
+      if iter % cfg.TRAIN.SNAPSHOT_ITERS == 0:
+        last_snapshot_iter = iter
+        ss_path, np_path = self.snapshot(sess, iter)
+        np_paths.append(np_path)
+        ss_paths.append(ss_path)
+
+        # Remove the old snapshots if there are too many
+        if len(np_paths) > cfg.TRAIN.SNAPSHOT_KEPT:
+          self.remove_snapshot(np_paths, ss_paths)
+
+      iter += 1
+
+    if last_snapshot_iter != iter - 1:
+      self.snapshot(sess, iter - 1)
+
+    self.writer.close()
+    self.valwriter.close()
+
 
 def get_training_roidb(imdb):
   """Returns a roidb (Region of Interest database) for use in training."""
@@ -371,8 +457,26 @@ def train_net(network, imdb, roidb, valroidb, output_dir, tb_dir,
   tfconfig.gpu_options.allow_growth = True
 
   with tf.Session(config=tfconfig) as sess:
-    sw = SolverWrapper(sess, network, imdb, roidb, valroidb, output_dir, tb_dir,
+    sw = SolverWrapper(sess, network, imdb, roidb, valroidb, output_dir, tb_dir, False,
                        pretrained_model=pretrained_model)
     print('Solving...')
     sw.train_model(sess, max_iters)
     print('done solving')
+
+
+def train_net_rpn(network, imdb, roidb, valroidb, output_dir, tb_dir,
+              pretrained_model=None,
+              max_iters=40000):
+  """Train a Faster R-CNN network."""
+  roidb = filter_roidb(roidb)
+  valroidb = filter_roidb(valroidb)
+
+  tfconfig = tf.ConfigProto(allow_soft_placement=True)
+  tfconfig.gpu_options.allow_growth = True
+
+  with tf.Session(config=tfconfig) as sess:
+    sw = SolverWrapper(sess, network, imdb, roidb, valroidb, output_dir, tb_dir, True,
+                       pretrained_model=pretrained_model)
+    print('Solving rpn network...')
+    sw.train_model_rpn(sess, max_iters)
+    print('done solving rpn network')

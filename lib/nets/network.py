@@ -261,6 +261,27 @@ class Network(object):
 
     return rois, cls_prob, bbox_pred
 
+  def _build_network_rpn(self, is_training=True):
+    # select initializers
+    if cfg.TRAIN.TRUNCATED:
+      initializer = tf.truncated_normal_initializer(mean=0.0, stddev=0.01)
+      initializer_bbox = tf.truncated_normal_initializer(mean=0.0, stddev=0.001)
+    else:
+      initializer = tf.random_normal_initializer(mean=0.0, stddev=0.01)
+      initializer_bbox = tf.random_normal_initializer(mean=0.0, stddev=0.001)
+
+    net_conv = self._image_to_head(is_training)
+
+    with tf.variable_scope(self._scope, self._scope):
+      # build the anchors for the image
+      self._anchor_component()
+      # region proposal network
+      rois = self._region_proposal(net_conv, is_training, initializer)
+
+    self._score_summaries.update(self._predictions)
+
+    return rois
+
   def _smooth_l1_loss(self, bbox_pred, bbox_targets, bbox_inside_weights, bbox_outside_weights, sigma=1.0, dim=[1]):
     sigma_2 = sigma ** 2
     box_diff = bbox_pred - bbox_targets
@@ -313,6 +334,36 @@ class Network(object):
       self._losses['rpn_loss_box'] = rpn_loss_box
 
       loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
+      regularization_loss = tf.add_n(tf.losses.get_regularization_losses(), 'regu')
+      self._losses['total_loss'] = loss + regularization_loss
+
+      self._event_summaries.update(self._losses)
+
+    return loss
+
+  def _add_losses_rpn(self, sigma_rpn=3.0):
+    with tf.variable_scope('LOSS_' + self._tag) as scope:
+      # RPN, class loss
+      rpn_cls_score = tf.reshape(self._predictions['rpn_cls_score_reshape'], [-1, 2])
+      rpn_label = tf.reshape(self._anchor_targets['rpn_labels'], [-1])
+      rpn_select = tf.where(tf.not_equal(rpn_label, -1))
+      rpn_cls_score = tf.reshape(tf.gather(rpn_cls_score, rpn_select), [-1, 2])
+      rpn_label = tf.reshape(tf.gather(rpn_label, rpn_select), [-1])
+      rpn_cross_entropy = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(logits=rpn_cls_score, labels=rpn_label))
+
+      # RPN, bbox loss
+      rpn_bbox_pred = self._predictions['rpn_bbox_pred']
+      rpn_bbox_targets = self._anchor_targets['rpn_bbox_targets']
+      rpn_bbox_inside_weights = self._anchor_targets['rpn_bbox_inside_weights']
+      rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights']
+      rpn_loss_box = self._smooth_l1_loss(rpn_bbox_pred, rpn_bbox_targets, rpn_bbox_inside_weights,
+                                          rpn_bbox_outside_weights, sigma=sigma_rpn, dim=[1, 2, 3])
+
+      self._losses['rpn_cross_entropy'] = rpn_cross_entropy
+      self._losses['rpn_loss_box'] = rpn_loss_box
+
+      loss = rpn_cross_entropy + rpn_loss_box
       regularization_loss = tf.add_n(tf.losses.get_regularization_losses(), 'regu')
       self._losses['total_loss'] = loss + regularization_loss
 
@@ -453,6 +504,71 @@ class Network(object):
 
     return layers_to_output
 
+  def create_architecture_rpn(self, mode, num_classes, tag=None,
+                          anchor_scales=(8, 16, 32), anchor_ratios=(0.5, 1, 2)):
+    self._image = tf.placeholder(tf.float32, shape=[1, None, None, 3])
+    self._im_info = tf.placeholder(tf.float32, shape=[3])
+    self._gt_boxes = tf.placeholder(tf.float32, shape=[None, 5])
+    self._tag = tag
+
+    self._num_classes = num_classes
+    self._mode = mode
+    self._anchor_scales = anchor_scales
+    self._num_scales = len(anchor_scales)
+
+    self._anchor_ratios = anchor_ratios
+    self._num_ratios = len(anchor_ratios)
+
+    self._num_anchors = self._num_scales * self._num_ratios
+
+    training = mode == 'TRAIN'
+    testing = mode == 'TEST'
+
+    assert tag != None
+
+    # handle most of the regularizers here
+    weights_regularizer = tf.contrib.layers.l2_regularizer(cfg.TRAIN.WEIGHT_DECAY)
+    if cfg.TRAIN.BIAS_DECAY:
+      biases_regularizer = weights_regularizer
+    else:
+      biases_regularizer = tf.no_regularizer
+
+    # list as many types of layers as possible, even if they are not used now
+    with arg_scope([slim.conv2d, slim.conv2d_in_plane, \
+                    slim.conv2d_transpose, slim.separable_conv2d, slim.fully_connected],
+                    weights_regularizer=weights_regularizer,
+                    biases_regularizer=biases_regularizer,
+                    biases_initializer=tf.constant_initializer(0.0)):
+      rois = self._build_network_rpn(training)
+
+    layers_to_output = {'rois': rois}
+
+    for var in tf.trainable_variables():
+      self._train_summaries.append(var)
+
+    if training:
+      self._add_losses_rpn()
+      layers_to_output.update(self._losses)
+
+      val_summaries = []
+      with tf.device("/cpu:0"):
+        val_summaries.append(self._add_gt_image_summary())
+        for key, var in self._event_summaries.items():
+          val_summaries.append(tf.summary.scalar(key, var))
+        for key, var in self._score_summaries.items():
+          self._add_score_summary(key, var)
+        for var in self._act_summaries:
+          self._add_act_summary(var)
+        for var in self._train_summaries:
+          self._add_train_summary(var)
+
+      self._summary_op = tf.summary.merge_all()
+      self._summary_op_val = tf.summary.merge(val_summaries)
+
+    layers_to_output.update(self._predictions)
+
+    return layers_to_output
+
   def get_variables_to_restore(self, variables, var_keep_dic):
     raise NotImplementedError
 
@@ -495,7 +611,30 @@ class Network(object):
                                                                         self._losses['total_loss'],
                                                                         train_op],
                                                                        feed_dict=feed_dict)
+
+  def train_step(self, sess, blobs, train_op):
+    feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
+                 self._gt_boxes: blobs['gt_boxes']}
+    rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, _ = sess.run([self._losses["rpn_cross_entropy"],
+                                                                        self._losses['rpn_loss_box'],
+                                                                        self._losses['cross_entropy'],
+                                                                        self._losses['loss_box'],
+                                                                        self._losses['total_loss'],
+                                                                        train_op],
+                                                                       feed_dict=feed_dict)
+
     return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss
+
+  def train_step_rpn(self, sess, blobs, train_op):
+    feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
+                 self._gt_boxes: blobs['gt_boxes']}
+    rpn_loss_cls, rpn_loss_box, loss, _ = sess.run([self._losses["rpn_cross_entropy"],
+                                                    self._losses['rpn_loss_box'],
+                                                    self._losses['total_loss'],
+                                                    train_op],
+                                                   feed_dict=feed_dict)
+
+    return rpn_loss_cls, rpn_loss_box, loss
 
   def train_step_with_summary(self, sess, blobs, train_op):
     feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
@@ -509,6 +648,17 @@ class Network(object):
                                                                                  train_op],
                                                                                 feed_dict=feed_dict)
     return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
+
+  def train_step_rpn_with_summary(self, sess, blobs, train_op):
+    feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
+                 self._gt_boxes: blobs['gt_boxes']}
+    rpn_loss_cls, rpn_loss_box, loss, summary, _ = sess.run([self._losses["rpn_cross_entropy"],
+                                                             self._losses['rpn_loss_box'],
+                                                             self._losses['total_loss'],
+                                                             self._summary_op,
+                                                             train_op],
+                                                            feed_dict=feed_dict)
+    return rpn_loss_cls, rpn_loss_box, loss, summary
 
   def train_step_no_return(self, sess, blobs, train_op):
     feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
