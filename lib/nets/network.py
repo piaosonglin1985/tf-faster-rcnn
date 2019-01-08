@@ -36,6 +36,7 @@ class Network(object):
     self._train_summaries = []
     self._event_summaries = {}
     self._variables_to_fix = {}
+    self._build_rpn_only = False
 
   def _add_gt_image(self):
     # add back mean

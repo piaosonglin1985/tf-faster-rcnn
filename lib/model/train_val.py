@@ -31,6 +31,7 @@ class SolverWrapper(object):
 
   def __init__(self, sess, network, imdb, roidb, valroidb, output_dir, tbdir, train_rpn_only, pretrained_model=None):
     self.net = network
+    self.net._build_rpn_only = train_rpn_only
     self.imdb = imdb
     self.roidb = roidb
     self.valroidb = valroidb

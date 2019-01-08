@@ -103,7 +103,7 @@ if __name__ == '__main__':
     raise NotImplementedError
 
   # load model
-  net.create_architecture("TEST", imdb.num_classes, tag='default',
+  net.create_architecture_rpn("TEST", imdb.num_classes, tag='default',
                           anchor_scales=cfg.ANCHOR_SCALES,
                           anchor_ratios=cfg.ANCHOR_RATIOS)
 
