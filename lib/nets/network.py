@@ -595,6 +595,15 @@ class Network(object):
                                                     feed_dict=feed_dict)
     return cls_score, cls_prob, bbox_pred, rois
 
+  # only useful during testing mode
+  def test_rpn_image(self, sess, image, im_info):
+    feed_dict = {self._image: image,
+                 self._im_info: im_info}
+
+    #here rois are generated after post processing e.g. nms or topN
+    rois = sess.run(self._predictions['rois'], feed_dict=feed_dict)
+    return rois
+
   def get_summary(self, sess, blobs):
     feed_dict = {self._image: blobs['data'], self._im_info: blobs['im_info'],
                  self._gt_boxes: blobs['gt_boxes']}
