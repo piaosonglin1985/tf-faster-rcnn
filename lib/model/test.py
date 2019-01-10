@@ -209,7 +209,7 @@ def test_rpn(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
   # all rpn proposed bounding boxes are collected into:
   #  all_roi_boxes[image] = N x 5 array of detections in
   #  (batchID(0), x1, y1, x2, y2)
-  all_roi_boxes = [[] for _ in range(num_images)]
+  all_roi_boxes = [np.array([]) for _ in range(num_images)]
 
   output_dir = get_output_dir(imdb, weights_filename)
   # timers
@@ -226,8 +226,8 @@ def test_rpn(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
     assert(all_roi_boxes[i].shape[1] == 4)
     _t['misc'].tic()
 
-    print('im_detect: {:d}/{:d} {:.3f}s {:.3f}s' \
-        .format(i + 1, num_images, _t['im_detect'].average_time,
+    print('region_proposal: {:d}/{:d} {:.3f}s {:.3f}s' \
+        .format(i + 1, num_images, _t['region_proposal'].average_time,
             _t['misc'].average_time))
 
   det_file = os.path.join(output_dir, 'rois.pkl')
@@ -235,5 +235,5 @@ def test_rpn(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
     pickle.dump(all_roi_boxes, f, pickle.HIGHEST_PROTOCOL)
 
   print('Evaluating rois')
-  imbd.evaluate_recall(candidate_boxes=all_roi_boxes, thresholds=None, area='all', limit=None)
+  imdb.evaluate_recall(candidate_boxes=all_roi_boxes, thresholds=None, area='all', limit=None)
 
